@@ -141,16 +141,18 @@ func GetNodeAddresses(cidrs []string, nw NetworkInterfacer) (sets.String, error)
 			uniqueAddressList.Insert(cidr)
 		}
 	}
+
+	itfs, err := nw.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("error listing all interfaces from host, error: %v", err)
+	}
+
 	// Second round of iteration to parse IPs based on cidr.
 	for _, cidr := range cidrs {
 		if IsZeroCIDR(cidr) {
 			continue
 		}
 		_, ipNet, _ := net.ParseCIDR(cidr)
-		itfs, err := nw.Interfaces()
-		if err != nil {
-			return nil, fmt.Errorf("error listing all interfaces from host, error: %v", err)
-		}
 		for _, itf := range itfs {
 			addrs, err := nw.Addrs(&itf)
 			if err != nil {

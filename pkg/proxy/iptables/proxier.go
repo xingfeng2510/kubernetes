@@ -409,7 +409,7 @@ func CleanupLeftovers(ipt utiliptables.Interface) (encounteredError bool) {
 		natRules := bytes.NewBuffer(nil)
 		writeLine(natChains, "*nat")
 		// Start with chains we know we need to remove.
-		for _, chain := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain, KubeMarkMasqChain} {
+		for _, chain := range []utiliptables.Chain{kubeServicesChain, kubeNodePortsChain, kubePostroutingChain} {
 			if _, found := existingNATChains[chain]; found {
 				chainString := string(chain)
 				writeBytesLine(natChains, existingNATChains[chain]) // flush
@@ -638,7 +638,7 @@ func (proxier *Proxier) syncProxyRules() {
 	start := time.Now()
 	defer func() {
 		metrics.SyncProxyRulesLatency.Observe(metrics.SinceInMicroseconds(start))
-		klog.V(4).Infof("syncProxyRules took %v", time.Since(start))
+		klog.Infof("syncProxyRules took %v", time.Since(start))
 	}()
 	// don't sync rules till we've received services and endpoints
 	if !proxier.endpointsSynced || !proxier.servicesSynced {
@@ -646,11 +646,18 @@ func (proxier *Proxier) syncProxyRules() {
 		return
 	}
 
+	nodeAddresses, err := utilproxy.GetNodeAddresses(proxier.nodePortAddresses, proxier.networkInterfacer)
+	if err != nil {
+		klog.Errorf("Failed to get node ip address matching nodeport cidrs %v, services with nodeport may not work as intended: %v", proxier.nodePortAddresses, err)
+	}
+
 	// We assume that if this was called, we really want to sync them,
 	// even if nothing changed in the meantime. In other words, callers are
 	// responsible for detecting no-op changes and not calling this function.
 	serviceUpdateResult := proxy.UpdateServiceMap(proxier.serviceMap, proxier.serviceChanges)
 	endpointUpdateResult := proxy.UpdateEndpointsMap(proxier.endpointsMap, proxier.endpointsChanges)
+
+	klog.Infof("StaleEndpoints: %v, StaleServiceNames: %v", endpointUpdateResult.StaleEndpoints, endpointUpdateResult.StaleServiceNames)
 
 	staleServices := serviceUpdateResult.UDPStaleClusterIP
 	// merge stale services gathered from updateEndpointsMap
@@ -661,7 +668,7 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 	}
 
-	klog.V(3).Info("Syncing iptables rules")
+	klog.Info("Syncing iptables rules")
 
 	// Create and link the kube chains.
 	for _, chain := range iptablesJumpChains {
@@ -687,7 +694,7 @@ func (proxier *Proxier) syncProxyRules() {
 	// This will be a map of chain name to chain with rules as stored in iptables-save/iptables-restore
 	existingFilterChains := make(map[utiliptables.Chain][]byte)
 	proxier.existingFilterChainsData.Reset()
-	err := proxier.iptables.SaveInto(utiliptables.TableFilter, proxier.existingFilterChainsData)
+	err = proxier.iptables.SaveInto(utiliptables.TableFilter, proxier.existingFilterChainsData)
 	if err != nil { // if we failed to get any rules
 		klog.Errorf("Failed to execute iptables-save, syncing all rules: %v", err)
 	} else { // otherwise parse the output
@@ -775,6 +782,8 @@ func (proxier *Proxier) syncProxyRules() {
 	for svcName := range proxier.serviceMap {
 		proxier.endpointChainsNumber += len(proxier.endpointsMap[svcName])
 	}
+
+	klog.Info("Building rules for services")
 
 	// Build rules for each service.
 	for svcName, svc := range proxier.serviceMap {
@@ -989,14 +998,12 @@ func (proxier *Proxier) syncProxyRules() {
 		if svcInfo.NodePort != 0 {
 			// Hold the local port open so no other process can open it
 			// (because the socket might open but it would never work).
-			addresses, err := utilproxy.GetNodeAddresses(proxier.nodePortAddresses, proxier.networkInterfacer)
-			if err != nil {
-				klog.Errorf("Failed to get node ip address matching nodeport cidr: %v", err)
+			if len(nodeAddresses) == 0 {
 				continue
 			}
 
 			lps := make([]utilproxy.LocalPort, 0)
-			for address := range addresses {
+			for address := range nodeAddresses {
 				lp := utilproxy.LocalPort{
 					Description: "nodePort for " + svcNameString,
 					IP:          address,
@@ -1233,6 +1240,8 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 	}
 
+	klog.Info("Deleting obsolete chains")
+
 	// Delete chains no longer in use.
 	for chain := range existingNATChains {
 		if !activeNATChains[chain] {
@@ -1251,36 +1260,31 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Finally, tail-call to the nodeports chain.  This needs to be after all
 	// other service portal rules.
-	addresses, err := utilproxy.GetNodeAddresses(proxier.nodePortAddresses, proxier.networkInterfacer)
-	if err != nil {
-		klog.Errorf("Failed to get node ip address matching nodeport cidr")
-	} else {
-		isIPv6 := proxier.iptables.IsIpv6()
-		for address := range addresses {
-			// TODO(thockin, m1093782566): If/when we have dual-stack support we will want to distinguish v4 from v6 zero-CIDRs.
-			if utilproxy.IsZeroCIDR(address) {
-				args = append(args[:0],
-					"-A", string(kubeServicesChain),
-					"-m", "comment", "--comment", `"kubernetes service nodeports; NOTE: this must be the last rule in this chain"`,
-					"-m", "addrtype", "--dst-type", "LOCAL",
-					"-j", string(kubeNodePortsChain))
-				writeLine(proxier.natRules, args...)
-				// Nothing else matters after the zero CIDR.
-				break
-			}
-			// Ignore IP addresses with incorrect version
-			if isIPv6 && !utilnet.IsIPv6String(address) || !isIPv6 && utilnet.IsIPv6String(address) {
-				klog.Errorf("IP address %s has incorrect IP version", address)
-				continue
-			}
-			// create nodeport rules for each IP one by one
+	isIPv6 := proxier.iptables.IsIpv6()
+	for address := range nodeAddresses {
+		// TODO(thockin, m1093782566): If/when we have dual-stack support we will want to distinguish v4 from v6 zero-CIDRs.
+		if utilproxy.IsZeroCIDR(address) {
 			args = append(args[:0],
 				"-A", string(kubeServicesChain),
 				"-m", "comment", "--comment", `"kubernetes service nodeports; NOTE: this must be the last rule in this chain"`,
-				"-d", address,
+				"-m", "addrtype", "--dst-type", "LOCAL",
 				"-j", string(kubeNodePortsChain))
 			writeLine(proxier.natRules, args...)
+			// Nothing else matters after the zero CIDR.
+			break
 		}
+		// Ignore IP addresses with incorrect version
+		if isIPv6 && !utilnet.IsIPv6String(address) || !isIPv6 && utilnet.IsIPv6String(address) {
+			klog.Errorf("IP address %s has incorrect IP version", address)
+			continue
+		}
+		// create nodeport rules for each IP one by one
+		args = append(args[:0],
+			"-A", string(kubeServicesChain),
+			"-m", "comment", "--comment", `"kubernetes service nodeports; NOTE: this must be the last rule in this chain"`,
+			"-d", address,
+			"-j", string(kubeNodePortsChain))
+		writeLine(proxier.natRules, args...)
 	}
 
 	// If the masqueradeMark has been added then we want to forward that same
@@ -1329,7 +1333,7 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.iptablesData.Write(proxier.natChains.Bytes())
 	proxier.iptablesData.Write(proxier.natRules.Bytes())
 
-	klog.V(5).Infof("Restoring iptables rules: %s", proxier.iptablesData.Bytes())
+	klog.Infof("Restoring iptables rules: %s", proxier.iptablesData.Bytes())
 	err = proxier.iptables.RestoreAll(proxier.iptablesData.Bytes(), utiliptables.NoFlushTables, utiliptables.RestoreCounters)
 	if err != nil {
 		klog.Errorf("Failed to execute iptables-restore: %v", err)
